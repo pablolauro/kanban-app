@@ -1,0 +1,13 @@
+# Normaliza as quebras de linha: LF no repositório, nativo no working copy.
+# Sem isso, clonar no Windows e no Linux produz diffs de arquivo inteiro.
+* text=auto eol=lf
+
+# Binários — nunca normalizar.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff  binary
+*.woff2 binary
+
+# Gerado pelo npm: colapsa no diff do GitHub.
+package-lock.json linguist-generated=true -diff
