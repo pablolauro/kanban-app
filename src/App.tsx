@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { BoardView } from './components/BoardView'
 import { CardDialog } from './components/CardDialog'
+import { LoadErrorScreen, UnlockScreen } from './components/StatusScreens'
 import { Topbar } from './components/Topbar'
 import { AlertIcon, FilterIcon } from './components/icons'
 import { Button, Modal } from './components/ui'
@@ -23,6 +24,7 @@ export default function App() {
   const columns = useBoardStore((s) => s.columns)
   const cards = useBoardStore((s) => s.cards)
   const init = useBoardStore((s) => s.init)
+  const unlock = useBoardStore((s) => s.unlock)
   const renameBoard = useBoardStore((s) => s.renameBoard)
   const updateCard = useBoardStore((s) => s.updateCard)
   const deleteCard = useBoardStore((s) => s.deleteCard)
@@ -40,6 +42,8 @@ export default function App() {
   const [openCardId, setOpenCardId] = useState<string | null>(null)
   const [confirmReset, setConfirmReset] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
+  // Só depois de uma tentativa o 401 significa "chave errada" (e não "sem chave").
+  const [triedKey, setTriedKey] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -74,6 +78,22 @@ export default function App() {
     } catch (err) {
       setImportError(err instanceof Error ? err.message : String(err))
     }
+  }
+
+  if (status === 'unauthorized') {
+    return (
+      <UnlockScreen
+        rejected={triedKey}
+        onUnlock={(key) => {
+          setTriedKey(true)
+          void unlock(key)
+        }}
+      />
+    )
+  }
+
+  if (status === 'error') {
+    return <LoadErrorScreen error={error} onRetry={() => void init()} />
   }
 
   if (status === 'loading' || status === 'idle') {

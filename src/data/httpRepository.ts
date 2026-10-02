@@ -5,26 +5,62 @@ import type {
   ColumnPositionPatch,
 } from './repository'
 
+/** Erro de API com o status HTTP — a store distingue 401 dos demais. */
+export class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
+    this.name = 'HttpError'
+  }
+}
+
+export interface HttpRepositoryOptions {
+  /** Chave enviada como `Authorization: Bearer`. Lida a cada request. */
+  accessKey: () => string | null
+  /**
+   * Semeia o servidor quando ele ainda não tem quadro (GET → 404). É por
+   * aqui que o quadro do localStorage sobe para o banco na primeira vez.
+   */
+  seed?: {
+    snapshot: () => BoardSnapshot
+    done: () => void
+  }
+}
+
 /**
- * Implementação FUTURA, para quando o Postgres/Neon entrar.
+ * Persistência via API (server/app.ts → Postgres/Neon).
  *
- * Está pronta e compila, mas não é usada ainda (ver `src/data/index.ts`).
- * Quando a API existir, basta:
- *
- *   // src/data/index.ts
- *   export const repository = new HttpBoardRepository('/api')
- *
- * Nenhum componente, nem a store, precisa mudar — é por isso que todos os
- * métodos do contrato já são assíncronos.
- *
- * O schema SQL correspondente está em `sql/schema.sql`.
+ * Nenhum componente nem a store sabe que existe rede: todos os métodos do
+ * contrato já eram assíncronos. O schema SQL está em `sql/schema.sql`.
  */
 export class HttpBoardRepository implements BoardRepository {
-  constructor(private readonly baseUrl: string, private readonly boardId?: Id) {}
+  constructor(
+    private readonly baseUrl: string,
+    private readonly options: HttpRepositoryOptions,
+  ) {}
 
-  load(): Promise<BoardSnapshot> {
-    const path = this.boardId ? `/boards/${this.boardId}` : '/boards/current'
-    return this.request<BoardSnapshot>('GET', path)
+  async load(): Promise<BoardSnapshot> {
+    const { seed } = this.options
+    if (!seed) return this.request<BoardSnapshot>('GET', '/boards/current')
+
+    try {
+      return await this.request<BoardSnapshot>('GET', '/boards/current')
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 404) throw err
+    }
+
+    const snapshot = seed.snapshot()
+    try {
+      // `import` só grava com o banco vazio; não sobrescreve outro navegador.
+      await this.request('POST', '/boards/import', snapshot)
+    } catch (err) {
+      // 409: outro navegador migrou primeiro — vale o que está no servidor.
+      if (err instanceof HttpError && err.status === 409) {
+        return this.request<BoardSnapshot>('GET', '/boards/current')
+      }
+      throw err
+    }
+    seed.done()
+    return snapshot
   }
 
   async renameBoard(title: string): Promise<void> {
@@ -73,14 +109,31 @@ export class HttpBoardRepository implements BoardRepository {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
-    })
-    if (!res.ok) {
-      throw new Error(`${method} ${path} falhou: ${res.status} ${res.statusText}`)
+    const headers: Record<string, string> = {}
+    const key = this.options.accessKey()
+    if (key) headers.Authorization = `Bearer ${key}`
+    if (body !== undefined) headers['Content-Type'] = 'application/json'
+
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      })
+    } catch {
+      throw new HttpError(0, 'sem conexão com o servidor')
     }
-    return res.status === 204 ? (undefined as T) : ((await res.json()) as T)
+    if (!res.ok) {
+      // A API responde `{ error }` em pt-BR; sem isso, cai no status.
+      const detail = await res
+        .json()
+        .then((j: { error?: string }) => j.error)
+        .catch(() => undefined)
+      throw new HttpError(res.status, detail ?? `${method} ${path} falhou (${res.status})`)
+    }
+    return res.status === 204 || res.status === 201
+      ? (undefined as T)
+      : ((await res.json()) as T)
   }
 }

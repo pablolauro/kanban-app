@@ -1,6 +1,6 @@
--- Schema alvo para Postgres/Neon.
--- O modelo em src/domain/types.ts mapeia 1:1 nestas tabelas; quando migrarmos,
--- a troca no front é só a linha de src/data/index.ts.
+-- Schema do Postgres/Neon, servido pela API em server/.
+-- O modelo em src/domain/types.ts mapeia 1:1 nestas tabelas (e os schemas
+-- zod de server/schemas.ts) — ao adicionar campo, atualize os três.
 
 create table if not exists boards (
   id          uuid primary key,
@@ -8,6 +8,10 @@ create table if not exists boards (
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
+-- Usuário único: no máximo um quadro. Garante que duas migrações do
+-- localStorage simultâneas não criem dois quadros (a segunda leva 409).
+-- Remover quando houver multiusuário (boards ganha user_id).
+create unique index if not exists boards_singleton on boards ((true));
 
 create table if not exists columns (
   id          uuid primary key,

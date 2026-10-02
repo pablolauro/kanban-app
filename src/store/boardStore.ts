@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { repository } from '../data'
+import { HttpError, repository, saveAccessKey } from '../data'
 import { createDefaultBoard } from '../data/defaultBoard'
 import { newId, nowIso, todayIso } from '../domain/ids'
 import {
@@ -28,7 +28,8 @@ export interface CardDraft {
   tags: string[]
 }
 
-type Status = 'idle' | 'loading' | 'ready' | 'error'
+/** `unauthorized`: a API recusou a chave de acesso (ou não há chave). */
+type Status = 'idle' | 'loading' | 'ready' | 'error' | 'unauthorized'
 
 interface BoardState {
   status: Status
@@ -38,6 +39,8 @@ interface BoardState {
   cards: Card[]
 
   init: () => Promise<void>
+  /** Guarda a chave de acesso (via camada de dados) e recarrega o quadro. */
+  unlock: (accessKey: string) => Promise<void>
 
   renameBoard: (title: string) => Promise<void>
 
@@ -84,8 +87,14 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         cards: sortByPosition(snapshot.cards),
       })
     } catch (err) {
-      set({ status: 'error', error: messageOf(err) })
+      const unauthorized = err instanceof HttpError && err.status === 401
+      set({ status: unauthorized ? 'unauthorized' : 'error', error: messageOf(err) })
     }
+  },
+
+  async unlock(accessKey) {
+    saveAccessKey(accessKey)
+    await get().init()
   },
 
   async renameBoard(title) {
@@ -364,8 +373,8 @@ function messageOf(err: unknown): string {
 
 /**
  * Escritas são otimistas: o estado muda na hora e a persistência acontece
- * depois. Se a persistência falhar (quota cheia hoje, rede amanhã),
- * registramos o erro para a UI avisar.
+ * depois. Se a persistência falhar (rede, chave recusada, validação da
+ * API), registramos o erro para a UI avisar.
  */
 async function guard(
   set: (partial: Partial<BoardState>) => void,

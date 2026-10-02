@@ -1,8 +1,8 @@
 # Kanban
 
 Quadro Kanban com colunas e cards totalmente editáveis, drag & drop e
-persistência local — desenhado para trocar o localStorage por Postgres sem
-refatorar a interface.
+persistência em Postgres (Neon) por meio de uma API própria no mesmo
+repositório.
 
 ## Stack
 
@@ -14,16 +14,39 @@ refatorar a interface.
 | Estilo | **Tailwind CSS v4** | Design consistente sem CSS paralelo; tema claro/escuro por tokens. |
 | Drag & drop | **@dnd-kit** | Funciona com mouse, toque **e teclado** (acessível), diferente do HTML5 DnD nativo. |
 | Estado | **Zustand** | Store única, sem boilerplate; as ações já são `async` para o dia do backend. |
-| Persistência | **localStorage** hoje | Atrás de uma interface — ver abaixo. |
+| API | **Hono** em `server/` | Roda igual em Node (dev) e como Vercel Function (`api/`). |
+| Banco | **Neon** (Postgres) via `@neondatabase/serverless` | Driver HTTP, sem pool — próprio para serverless. |
+| Validação | **zod** | Todo corpo que entra na API; schemas amarrados aos tipos do domínio. |
 
 ## Rodando
 
 ```bash
 npm install
-npm run dev        # http://localhost:5173
-npm run build      # typecheck + bundle de produção em dist/
+cp .env.example .env.local   # DATABASE_URL e API_TOKEN
+npm run dev        # Vite em :5173 + API em :3000 (proxy /api)
+npm run build      # typecheck (front + server) + bundle em dist/
 npm run typecheck
 ```
+
+Na primeira abertura o app pede a **chave de acesso** (o valor de
+`API_TOKEN`) e a guarda no navegador. Não há login: é um quadro de usuário
+único, e a chave é o que impede qualquer um com a URL de ler ou escrever.
+
+### Deploy (Vercel)
+
+O front sai de `dist/` e a API é a Function `api/index.ts` (o `vercel.json`
+reescreve `/api/*` para ela). Configure no projeto da Vercel as variáveis
+`DATABASE_URL` (branch `main` do Neon, connection string *pooled*) e
+`API_TOKEN`.
+
+### Migração do localStorage
+
+Quando o servidor responde que não há quadro (`GET /api/boards/current` →
+404), o app envia o quadro salvo no localStorage **desta origem** para
+`POST /api/boards/import` — ou o quadro padrão, se não houver nada salvo. O
+import só grava com o banco vazio (409 caso contrário, reforçado pelo índice
+`boards_singleton`), então um segundo navegador nunca sobrescreve o primeiro.
+O `kanban.board.v1` local não é apagado: fica como backup.
 
 ## O que dá para fazer
 
@@ -72,24 +95,26 @@ src/
     ordering.ts    posições fracionárias (ver abaixo)
   data/
     repository.ts            <- CONTRATO: toda escrita passa por aqui
-    localStorageRepository.ts <- implementação de hoje
-    httpRepository.ts         <- implementação de amanhã (já escrita)
+    httpRepository.ts         <- implementação em uso (API)
+    migration.ts              <- semeia o servidor com o quadro local
+    localStorageRepository.ts <- implementação anterior (ainda compila)
     index.ts                  <- ÚNICO ponto de troca
   store/boardStore.ts   Zustand. Chama só a interface, nunca o storage.
-  components/           UI. Não sabe nem que localStorage existe.
-sql/schema.sql          Schema alvo em Postgres/Neon
+  components/           UI. Não sabe que existe rede nem storage.
+server/
+  app.ts                Rotas Hono — espelham o httpRepository 1:1
+  schemas.ts            Validação zod (regras de entrada)
+  db.ts                 Cliente Neon e SQL de leitura/inserção em lote
+  auth.ts               Bearer API_TOKEN
+  dev.ts                Servidor Node local (porta 3000)
+api/index.ts            Adaptador Vercel Function
+sql/schema.sql          Schema do Postgres/Neon
 ```
 
-### Trocar para Postgres/Neon
+### Por que a troca para o banco foi barata
 
-Uma linha:
-
-```ts
-// src/data/index.ts
-export const repository: BoardRepository = new HttpBoardRepository('/api')
-```
-
-Isso funciona porque:
+O front passou de localStorage para a API trocando a implementação em
+`src/data/index.ts` — nenhum componente mudou. Isso funciona porque:
 
 1. **Todos os métodos do repositório já são `Promise`**, mesmo com
    localStorage sendo síncrono. A UI já convive com latência, então a rede
@@ -104,9 +129,9 @@ Isso funciona porque:
 4. **Escritas são otimistas**: o estado muda na tela e a persistência vai
    atrás; falha aparece como aviso no topo (`guard()` no store).
 
-O que falta no dia da migração: subir as tabelas de `sql/schema.sql` e expor
-as rotas que `httpRepository.ts` já chama (`GET /boards/current`,
-`POST /cards`, `PATCH /cards/positions`, …).
+No servidor, escritas com mais de um comando (mover vários cards, importar
+o quadro) vão numa única transação do Neon, e `PATCH /cards/positions`
+atualiza o lote inteiro num só `UPDATE ... FROM jsonb_array_elements`.
 
 ## Teste de drag & drop
 
@@ -115,8 +140,12 @@ npm run dev          # em um terminal
 npm run test:e2e     # em outro — usa o Chrome instalado, sem baixar browser
 ```
 
-`tests/drag.mjs` dirige o navegador de verdade e checa o **localStorage** depois
-de cada arraste (é o que prova que persistiu, não só que a tela mexeu):
+**O teste apaga o quadro** (usa "Recomeçar quadro"). Por isso ele só roda se
+o `.env.local` tiver `E2E_RESET_OK=1` — linha que só deve existir no env que
+aponta para a branch `dev` do Neon, nunca para a `main`.
+
+`tests/drag.mjs` dirige o navegador de verdade e checa **o banco, via API**,
+depois de cada arraste (é o que prova que persistiu, não só que a tela mexeu):
 
 1. card muda de coluna arrastando;
 2. card reordena dentro da própria coluna;

@@ -6,15 +6,31 @@
  *
  * Variáveis: BASE_URL (default http://localhost:5173), HEADED=1 para ver.
  *
- * Verifica o que o dnd-kit faz de verdade no DOM e o que sobra no
- * localStorage — é o localStorage que prova que a mudança persistiu.
+ * Verifica o que o dnd-kit faz de verdade no DOM e o que chegou no banco —
+ * é a resposta da API (GET /api/boards/current) que prova que persistiu.
+ *
+ * O teste APAGA o quadro ("Recomeçar quadro"). Por isso só roda se o
+ * .env.local tiver E2E_RESET_OK=1 — linha que só existe no env que aponta
+ * para a branch `dev` do Neon, nunca no de produção.
  */
+import { readFileSync } from 'node:fs'
 import { chromium } from 'playwright'
 
 const BASE_URL = process.env.BASE_URL ?? 'http://localhost:5173'
-const STORAGE_KEY = 'kanban.board.v1'
+const env = readEnv('.env.local')
+const API_TOKEN = process.env.API_TOKEN ?? env.API_TOKEN
+
+if ((process.env.E2E_RESET_OK ?? env.E2E_RESET_OK) !== '1') {
+  console.error(
+    'Recusado: o teste apaga o quadro. Aponte o .env.local para a branch dev do\n' +
+      'Neon e adicione E2E_RESET_OK=1 (nunca no env de produção).',
+  )
+  process.exit(1)
+}
 
 let failures = 0
+/** Requests /api/ ainda em voo — as escritas são otimistas, a tela não espera. */
+let inflight = 0
 
 function check(name, ok, detail = '') {
   if (ok) {
@@ -25,11 +41,44 @@ function check(name, ok, detail = '') {
   }
 }
 
-const snapshotOf = (page) =>
-  page.evaluate(
-    (key) => JSON.parse(localStorage.getItem(key) ?? 'null')?.snapshot ?? null,
-    STORAGE_KEY,
-  )
+function readEnv(path) {
+  try {
+    return Object.fromEntries(
+      readFileSync(path, 'utf8')
+        .split(/\r?\n/)
+        .filter((line) => line.includes('=') && !line.startsWith('#'))
+        .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1).trim()]),
+    )
+  } catch {
+    return {}
+  }
+}
+
+/** Espera as escritas otimistas chegarem ao servidor. */
+async function settle(page) {
+  await page.waitForTimeout(50)
+  while (inflight > 0) await page.waitForTimeout(25)
+}
+
+/** Estado persistido, lido direto da API (não da tela). */
+async function snapshotOf(page) {
+  await settle(page)
+  const res = await fetch(`${BASE_URL}/api/boards/current`, {
+    headers: { Authorization: `Bearer ${API_TOKEN}` },
+  })
+  if (!res.ok) throw new Error(`GET /api/boards/current: ${res.status}`)
+  return res.json()
+}
+
+/** Volta ao quadro padrão pelo próprio app ("Recomeçar quadro" → PUT). */
+async function resetBoard(page) {
+  await page.getByRole('button', { name: 'Mais opções' }).click()
+  await page.getByRole('menuitem', { name: /Recomeçar quadro/ }).click()
+  await page.getByRole('dialog').getByRole('button', { name: 'Recomeçar' }).click()
+  await settle(page)
+  await page.reload()
+  await page.locator('section[aria-label^="Coluna "]').first().waitFor()
+}
 
 const columnByTitle = (snapshot, title) =>
   snapshot.columns.find((c) => c.title === title)
@@ -74,11 +123,20 @@ const run = async () => {
     console.log(`  FAIL  erro de runtime na página — ${err.message}`)
   })
 
+  const isApi = (req) => new URL(req.url()).pathname.startsWith('/api/')
+  page.on('request', (req) => isApi(req) && inflight++)
+  page.on('requestfinished', (req) => isApi(req) && inflight--)
+  page.on('requestfailed', (req) => isApi(req) && inflight--)
+
+  // A chave da API entra antes do app carregar, como se já tivesse sido digitada.
+  await page.addInitScript((token) => {
+    localStorage.setItem('kanban.apiToken', token)
+  }, API_TOKEN)
+
   // Começa de um quadro limpo, com as colunas e cards padrão.
   await page.goto(BASE_URL)
-  await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY)
-  await page.reload()
   await page.locator('section[aria-label^="Coluna "]').first().waitFor()
+  await resetBoard(page)
 
   const toDo = page.locator('section[aria-label="Coluna A Fazer"]')
   const doing = page.locator('section[aria-label="Coluna Em Andamento"]')
@@ -95,7 +153,7 @@ const run = async () => {
     const after = await snapshotOf(page)
     const moved = after.cards.find((c) => c.id === card.id)
     check(
-      'columnId do card virou "Em Andamento" no localStorage',
+      'columnId do card virou "Em Andamento" no banco',
       moved.columnId === target.id,
       `columnId=${moved.columnId}`,
     )
@@ -375,9 +433,7 @@ const run = async () => {
   console.log('11) filtro de prioridade esconde o que nao bate')
   {
     // Recomeca do quadro padrao: o filtro e estado de sessao, some no reload.
-    await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY)
-    await page.reload()
-    await page.locator('section[aria-label^="Coluna "]').first().waitFor()
+    await resetBoard(page)
 
     const chips = page.getByRole('group', { name: 'Filtrar por prioridade' })
     await chips.getByRole('button', { name: 'Baixa' }).click()
@@ -392,9 +448,9 @@ const run = async () => {
       `visiveis=${visiveis} esperados=${baixas}`,
     )
     check(
-      'nenhum card foi apagado do localStorage',
+      'nenhum card foi apagado do banco',
       snapshot.cards.length === 4,
-      `cards no storage=${snapshot.cards.length}`,
+      `cards no banco=${snapshot.cards.length}`,
     )
     check(
       'barra avisa quantos ficaram ocultos',

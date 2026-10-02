@@ -5,11 +5,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-npm run dev          # Vite dev server em http://localhost:5173
-npm run typecheck    # tsc -b --noEmit (único gate estático — não há linter)
+npm run dev          # Vite :5173 + API :3000 (concurrently); proxy /api → API_PORT
+npm run dev:api      # só a API (tsx watch, lê .env.local)
+npm run typecheck    # tsc -b --noEmit, cobre src/ e server/+api/ (tsconfig.server.json)
 npm run build        # tsc -b && vite build
 npm run test:e2e     # testes de ponta a ponta; EXIGE o dev server rodando
 ```
+
+`.env.local` (ignorado pelo git; modelo em `.env.example`): `DATABASE_URL`,
+`API_TOKEN` e, só no env da branch `dev`, `E2E_RESET_OK=1`. O `.env.local`
+aponta para a branch `dev`; os valores de produção (branch `main`, os mesmos
+da Vercel) ficam em `.env.production.local` — sem prefixo `VITE_`, então o
+Vite nunca os expõe no bundle.
 
 `npm run test:e2e` roda [tests/drag.mjs](tests/drag.mjs): um script Playwright
 sem framework de teste, que dirige o **Chrome instalado na máquina**
@@ -21,26 +28,40 @@ caso isolado, comente os blocos vizinhos no script — cada caso é um bloco
 `{ ... }` numerado e independente, exceto pelo estado do quadro que o anterior
 deixou. O script grava `tests/board.png` ao final.
 
+**O e2e apaga o quadro** ("Recomeçar quadro") e lê o estado persistido via
+`GET /api/boards/current`. Ele se recusa a rodar sem `E2E_RESET_OK=1` — nunca
+ponha essa linha num env que aponte para a branch `main` do Neon (produção).
+Para rodar isolado do dev server do usuário: API com outro env em
+`API_PORT=3001` e `API_PORT=3001 npx vite --port 5174`, depois
+`BASE_URL=http://localhost:5174 npm run test:e2e`.
+
 Interface e comentários de código estão em **português (pt-BR)**.
 
 ## Arquitetura
 
-Três camadas, com uma regra que governa o resto: **componentes e store nunca
-tocam em `localStorage`**. Toda escrita atravessa a interface `BoardRepository`.
+Monólito modular: front (Vite/React) e API (Hono) no mesmo repo e no mesmo
+deploy Vercel. Regra que governa o resto: **componentes e store nunca tocam em
+`localStorage` nem em `fetch`**. Toda escrita atravessa a interface
+`BoardRepository`; storage do navegador (chave de acesso, backup da migração)
+só em `src/data/`.
 
 ```
 src/domain/     Regras puras. Zero React, zero storage.
-src/data/       Persistência atrás de um contrato
+src/data/       Persistência atrás de um contrato (HttpBoardRepository em uso)
 src/store/      Zustand — chama só a interface
 src/components/ UI
-sql/schema.sql  Schema alvo em Postgres/Neon
+server/         API Hono: app.ts (rotas), schemas.ts (zod), db.ts (Neon), auth.ts
+api/index.ts    Adaptador Vercel Function; vercel.json reescreve /api/* para cá
+sql/schema.sql  Schema do Postgres/Neon
 ```
 
-O projeto hoje salva em `localStorage`, mas foi desenhado para migrar para
-Postgres/Neon trocando **uma linha** em [src/data/index.ts](src/data/index.ts)
-(`LocalStorageBoardRepository` → `HttpBoardRepository`, que já está escrito e
-compilando em [httpRepository.ts](src/data/httpRepository.ts)). Quatro decisões
-sustentam isso — quebrá-las custa uma refatoração inteira depois:
+Neon: projeto `kanban-app` (`twilight-smoke-28532124`, aws-sa-east-1). Branch
+`main` = produção (Vercel); branch `dev` = desenvolvimento local e e2e.
+
+Persistência em Postgres/Neon via [src/data/index.ts](src/data/index.ts)
+(`HttpBoardRepository`). O `LocalStorageBoardRepository` continua compilando,
+e `safeRead()` dele é reusado pela migração. Quatro decisões sustentam a
+camada de dados — quebrá-las custa uma refatoração inteira:
 
 1. **Todos os métodos do repositório são `Promise`**, mesmo com localStorage
    sendo síncrono. A UI já convive com latência.
@@ -53,8 +74,12 @@ sustentam isso — quebrá-las custa uma refatoração inteira depois:
 4. **Escritas otimistas**: o estado muda na hora, a persistência vai atrás, e
    `guard()` no store captura a falha em `state.error` (a UI mostra um aviso).
 
-`sql/schema.sql` espelha [domain/types.ts](src/domain/types.ts) 1:1 — ao
-adicionar campo a `Card`/`Column`, atualize os dois.
+`sql/schema.sql` espelha [domain/types.ts](src/domain/types.ts) 1:1, e
+[server/schemas.ts](server/schemas.ts) valida o mesmo formato (`satisfies
+z.ZodType<Card>` acusa divergência no typecheck). Ao adicionar campo a
+`Card`/`Column`, atualize os **três**, mais os SELECT/INSERT de
+[server/db.ts](server/db.ts) e a whitelist de `setClause` em
+[server/app.ts](server/app.ts) — e aplique o `ALTER TABLE` nas duas branches.
 
 ### Invariantes que não são óbvias no código
 
@@ -68,9 +93,21 @@ adicionar campo a `Card`/`Column`, atualize os dois.
   Durante o arraste o card passeia por várias colunas em preview; só o commit
   grava. Por isso o carimbo de `completedAt` mora no commit, não no preview.
 
-- **Novos campos em `Card`/`Column` precisam de default em `safeRead()`**
-  ([localStorageRepository.ts](src/data/localStorageRepository.ts)) — é a
-  migração de quadros já salvos na máquina do usuário.
+- **Migração do localStorage**: `GET /boards/current` → 404 faz o
+  `HttpBoardRepository.load()` enviar `seedSnapshot()`
+  ([migration.ts](src/data/migration.ts)) para `POST /boards/import`, que só
+  grava com o banco vazio (409 senão; índice `boards_singleton` fecha a
+  corrida). `PUT /boards/current` é outra coisa: substitui tudo (importar
+  JSON / recomeçar). O backup `kanban.board.v1` nunca é apagado.
+
+- **Datas `date` saem do banco como `::text`** em [server/db.ts](server/db.ts).
+  O parser do driver viraria `Date` à meia-noite UTC e deslocaria o dia.
+
+- **`completedAt` em `PATCH /cards/positions`**: chave ausente = não mexe;
+  `null` = limpa (`p ? 'completedAt'` no SQL). Não troque por default.
+
+- **Retry só em leitura** (`retryRead` em db.ts): o Neon às vezes derruba o
+  socket keep-alive (`fetch failed`). Repetir escrita pode duplicar efeito.
 
 - **Coluna de conclusão é a flag `isDone`, nunca o título.** Colunas são
   renomeáveis; casar por `'Concluído'` quebra silenciosamente. `looksDone()`

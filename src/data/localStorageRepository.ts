@@ -138,7 +138,8 @@ export class LocalStorageBoardRepository implements BoardRepository {
   }
 }
 
-function safeRead(): Persisted | null {
+/** Exportado também para a migração ao servidor (`migration.ts`). */
+export function safeRead(): Persisted | null {
   try {
     const text = localStorage.getItem(STORAGE_KEY)
     if (!text) return null
